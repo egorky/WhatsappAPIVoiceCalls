@@ -11,10 +11,11 @@ This document outlines the configuration and conceptual architecture for integra
     *   [pjsip.conf](#pjsipconf)
     *   [extensions.conf](#extensionsconf)
     *   [TLS Certificates](#tls-certificates)
-5.  [Conceptual ARI Script (Node.js)](#conceptual-ari-script-nodejs)
+    *   [ARI Configuration (ari.conf, http.conf)](#ari-configuration-ariconf-httpconf)
+5.  [Functional ARI Script (Node.js)](#functional-ari-script-nodejs)
 6.  [WebRTC Client Configuration](#webrtc-client-configuration)
 7.  [Call Flows](#call-flows)
-    *   [Inbound: WhatsApp User to WebRTC Client](#inbound-whatsapp-user-to-webrtc-client)
+    *   [Inbound: WhatsApp User to WebRTC Client (via ARI)](#inbound-whatsapp-user-to-webrtc-client-via-ari)
     *   [Outbound: WebRTC Client to WhatsApp User](#outbound-webrtc-client-to-whatsapp-user)
 
 ## Architecture Overview
@@ -29,7 +30,7 @@ The system enables voice communication between WhatsApp users and a WebRTC clien
     *   Routes calls to WhatsApp via the SIP trunk.
     *   Handles SIP signaling and RTP media relay.
 *   **WebRTC Client:** A browser-based SIP client (as found in this repository) that registers with Asterisk and makes/receives calls.
-*   **ARI (Asterisk REST Interface) Script (Conceptual):** While not implemented due to project constraints (no library installation), an ARI script would typically manage call logic, such as bridging calls, handling call events, and interacting with external systems if needed. For this setup, basic dialing is handled by `extensions.conf`. More complex scenarios might require ARI.
+*   **ARI (Asterisk REST Interface) Script:** A Node.js script (`ari_scripts/ari_whatsapp_connector.js`) that connects to Asterisk's ARI interface to manage call logic, specifically for bridging incoming WhatsApp calls to the WebRTC client.
 
 ```mermaid
 graph TD
@@ -182,13 +183,13 @@ clearglobalvars=no
 [globals]
 WEB_CLIENT_EXTEN=1000 ; Example extension for the WebRTC client. This should match the user the WebRTC client registers as, or a way to reach them.
 YOUR_WHATSAPP_BUSINESS_NUMBER=+12345678901 ; IMPORTANT: Your full WhatsApp Business number with country code
+ARI_APP_NAME=whatsapp-ari-app ; Stasis application name, must match ari_whatsapp_connector.js configuration
 
 [from-whatsapp]
 ; Context for incoming calls from WhatsApp
-exten => _X.,1,NoOp(Incoming call from WhatsApp: ${CALLERID(all)} to ${EXTEN})
-  ; Here, EXTEN will be the number WhatsApp is trying to reach (likely your WhatsApp Business Number)
-  ; We want to route this to our internal WebRTC client extension
-  same => n,Dial(PJSIP/${WEB_CLIENT_EXTEN},45,Ttor) ; Dial the WebRTC client (exten 1000) for 45 seconds
+; Route to the Stasis application handled by ari_whatsapp_connector.js
+exten => _X.,1,NoOp(Incoming call from WhatsApp: ${CALLERID(all)} to ${EXTEN}. Routing to ARI Stasis app: ${ARI_APP_NAME})
+  same => n,Stasis(${ARI_APP_NAME},${EXTEN}) ; Pass the originally dialed number as an argument to the ARI app
   same => n,Hangup()
 
 [from-webrtc]
@@ -218,6 +219,46 @@ exten => ${WEB_CLIENT_EXTEN},1,NoOp(Call to WebRTC client ${EXTEN} from ${CALLER
     *   `o`: Set the caller ID to what was set by `Set(CALLERID(num)=...)` for calls to the PJSIP channel.
     *   `r`: Generate ringing to the calling party.
 
+### ARI Configuration (ari.conf, http.conf)
+
+For the `ari_whatsapp_connector.js` script to function, you need to configure Asterisk's HTTP server and the ARI user.
+
+**`/etc/asterisk/http.conf`**:
+Ensure the HTTP server is enabled and configured (adjust `bindaddr` and `bindport` as needed).
+
+```ini
+[general]
+enabled=yes
+bindaddr=0.0.0.0 ; Or specific IP
+bindport=8088     ; Port for ARI HTTP access
+prefix=ari        ; Optional: sets the base path for ARI to /ari, so full URL is http://ip:port/ari/...
+; enablestatic=yes ; If you want to serve static files via Asterisk HTTP
+```
+
+**`/etc/asterisk/ari.conf`**:
+Define an ARI user that the Node.js script will use to connect.
+
+```ini
+[general]
+enabled = yes
+pretty = yes ; Useful for debugging ARI responses
+
+[asterisk_ari_user] ; Username used in ari_whatsapp_connector.js
+type = user
+read_only = no ; Script needs to perform actions like originating calls, bridging
+password = ari_password ; Password used in ari_whatsapp_connector.js
+# If using plaintext passwords (not recommended for production without other security layers)
+# password_format = plain
+# For better security, consider using hashed passwords or other auth mechanisms if supported/needed.
+```
+
+After configuring these, reload the relevant Asterisk modules:
+```bash
+sudo asterisk -rx "module reload res_ari.so"
+sudo asterisk -rx "module reload res_http_websocket.so" # If http.conf was changed
+sudo asterisk -rx "http reload" # Or core reload
+```
+
 ### TLS Certificates
 
 For WebRTC (specifically for `wss` transport and DTLS-SRTP), Asterisk needs valid TLS certificates.
@@ -236,164 +277,68 @@ For WebRTC (specifically for `wss` transport and DTLS-SRTP), Asterisk needs vali
     ```
     (Adjust user/group if your Asterisk runs as a different user).
 
-## Conceptual ARI Script (Node.js)
+## Functional ARI Script (Node.js)
 
-**Important:** As per the initial request, no libraries are to be installed. The following is a conceptual guide. For a real implementation, you would install `asterisk-ari-client` and `ws`.
+A Node.js script, `ari_scripts/ari_whatsapp_connector.js`, is provided to handle the call logic between WhatsApp and the WebRTC client using Asterisk's REST Interface (ARI).
 
-This script outlines how you *could* use ARI for more advanced call control. For the basic routing described, `extensions.conf` is sufficient.
+**Location:** `ari_scripts/ari_whatsapp_connector.js`
 
-```javascript
-// Filename: conceptual-ari-app.js
-// IMPORTANT: This is conceptual. You would need to install 'asterisk-ari-client' and 'ws'.
-// const Ari = require('asterisk-ari-client');
-// const WebSocket = require('ws');
+**Purpose:**
+*   Connects to Asterisk's ARI.
+*   Listens for incoming calls on a specified Stasis application (e.g., `whatsapp-ari-app`, configured in `extensions.conf`).
+*   When an incoming call from WhatsApp arrives:
+    *   Answers the call.
+    *   Originates a new call to the configured WebRTC client SIP endpoint (e.g., `PJSIP/web_client`).
+    *   Creates a mixing bridge.
+    *   Adds both the incoming WhatsApp channel and the outgoing WebRTC client channel to the bridge.
+    *   Handles hangups on either channel to terminate the other and clean up the bridge.
 
-const ARI_USER = 'asterisk_ari_user'; // Define this user in ari.conf
-const ARI_PASSWORD = 'ari_password';   // Define this password in ari.conf
-const ARI_URL = 'http://localhost:8088'; // Your Asterisk ARI HTTP URL
-const APP_NAME = 'whatsapp-connector';   // Your Stasis application name, defined in extensions.conf
-
-/*
-Conceptual Logic:
-
-1. Connect to ARI:
-   - Establish a WebSocket connection to Asterisk's ARI event stream.
-   - Authenticate with ARI.
-
-2. Stasis Application Registration:
-   - In extensions.conf, incoming calls from WhatsApp would be directed to a Stasis() application.
-     Example in extensions.conf [from-whatsapp]:
-     exten => _X.,1,NoOp(ARI handling for ${EXTEN})
-     same => n,Stasis(whatsapp-connector,${EXTEN}) ; Pass dialed number to ARI app
-     same => n,Hangup()
-
-3. Handle 'StasisStart' Event:
-   - When a call enters the Stasis application (e.g., an incoming WhatsApp call).
-   - The event contains the incoming channel.
-   - Extract caller information (e.g., CALLERID(num) from WhatsApp).
-   - Get the dialed number (passed as an argument to Stasis).
-
-4. Originate Outgoing Call to WebRTC Client:
-   - Use ARI to create a new call (originate) to the WebRTC client's PJSIP endpoint.
-     e.g., `PJSIP/web_client` or `PJSIP/1000`.
-
-5. Bridge Calls:
-   - Once the outgoing call to the WebRTC client is answered ('ChannelStateChange' to 'Up', or another 'StasisStart' if the WebRTC client is also in a Stasis app).
-   - Create a new bridge in ARI.
-   - Add both the incoming WhatsApp channel and the outgoing WebRTC client channel to the bridge.
-   - Media will then flow between the two parties.
-
-6. Handle 'StasisEnd' Event:
-   - When a channel involved in the Stasis application hangs up.
-   - If one party hangs up, ensure the other channel in the bridge is also hung up.
-   - Clean up resources (e.g., destroy the bridge).
-
-7. Handle Outbound Calls (WebRTC to WhatsApp):
-   - If the WebRTC client dials out via a Stasis app (less common for basic SIP trunking, usually handled by dialplan).
-   - 'StasisStart' for the WebRTC client's channel.
-   - Originate a call to WhatsApp via the PJSIP trunk (`PJSIP/${NUMBER_TO_DIAL}@whatsapp_trunk_endpoint`).
-   - Bridge the calls.
-
-Error Handling:
- - Implement robust error handling for ARI commands and events.
- - Handle scenarios like call rejection, busy signals, timeouts.
-
-Example ARI Client Usage (Conceptual):
-
-async function startAriApp() {
-    let client;
-    try {
-        // client = await Ari.connect(ARI_URL, ARI_USER, ARI_PASSWORD);
-        console.log('Conceptual: Connected to ARI');
-
-        // client.on('StasisStart', async (event, incomingChannel) => {
-        //     console.log(`Conceptual: Call ${incomingChannel.id} entering Stasis app. Dialed: ${event.args[0]}`);
-        //     await incomingChannel.answer(); // Answer the incoming call from WhatsApp
-
-        //     const webRtcEndpoint = 'PJSIP/web_client'; // Or your specific WebRTC client endpoint
-        //     let outgoingChannel;
-        //     try {
-        //         // outgoingChannel = await client.channels.originate({
-        //         //   endpoint: webRtcEndpoint,
-        //         //   app: APP_NAME, // Or another app, or just dialplan
-        //         //   callerId: event.channel.caller.number, // Pass original caller ID
-        //         // });
-        //         console.log(`Conceptual: Originated call to ${webRtcEndpoint}`);
-
-        //         const bridge = client.Bridge();
-        //         await bridge.create({ type: 'mixing' });
-        //         console.log(`Conceptual: Bridge ${bridge.id} created.`);
-
-        //         await bridge.addChannel({ channel: [incomingChannel.id, outgoingChannel.id] });
-        //         console.log(`Conceptual: Added channels to bridge.`);
-
-        //         incomingChannel.on('StasisEnd', () => {
-        //             console.log(`Conceptual: Incoming channel ${incomingChannel.id} hung up.`);
-        //             // outgoingChannel.hangup().catch(err => console.error(err));
-        //             // bridge.destroy().catch(err => console.error(err));
-        //         });
-        //         outgoingChannel.on('StasisEnd', () => {
-        //             console.log(`Conceptual: Outgoing channel ${outgoingChannel.id} hung up.`);
-        //             // incomingChannel.hangup().catch(err => console.error(err));
-        //             // bridge.destroy().catch(err => console.error(err));
-        //         });
-
-        //     } catch (err) {
-        //         console.error('Conceptual: Error originating or bridging call:', err);
-        //         // incomingChannel.hangup().catch(e => console.error(e));
-        //     }
-        // });
-
-        // await client.start(APP_NAME); // Start listening for events for this app
-        console.log(`Conceptual: Stasis application '${APP_NAME}' started and listening.`);
-
-    } catch (err) {
-        console.error('Conceptual: Could not connect to ARI or start app:', err);
-        process.exit(1);
-    }
-}
-
-// startAriApp(); // Call this function to start
-
-*/
-
-console.log("This is a conceptual ARI script placeholder. See comments for logic.");
-console.log("For actual implementation, uncomment and install 'asterisk-ari-client' and 'ws'.");
-console.log("You would also need to configure 'ari.conf' and 'http.conf' in Asterisk,");
-console.log("and adjust 'extensions.conf' to send calls to the Stasis application.");
-```
-
-**To make ARI functional (beyond this conceptual placeholder):**
-
-1.  **Configure `ari.conf`:**
-    *   Enable ARI and define a user with permissions.
-    ```ini
-    ; /etc/asterisk/ari.conf
-    [general]
-    enabled = yes
-    pretty = yes ; For easier debugging
-
-    [asterisk_ari_user] ; Matches ARI_USER in script
-    type = user
-    read_only = no ; For call control actions
-    password = ari_password ; Matches ARI_PASSWORD
-    ; password_format = plain ; If using plain text password
+**Prerequisites for the ARI Script:**
+1.  **Node.js and npm/yarn:** Ensure Node.js is installed on the machine where you'll run this script (can be the Asterisk server or another machine with network access to Asterisk's ARI port).
+2.  **Dependencies:** Install the necessary Node.js packages. The `package.json` has been updated to include `ari-client` and `ws`. Run:
+    ```bash
+    npm install
+    # or
+    # yarn install
     ```
-2.  **Configure `http.conf`:**
-    *   Enable the Asterisk HTTP server, which ARI uses.
-    ```ini
-    ; /etc/asterisk/http.conf
-    [general]
-    enabled = yes
-    bindaddr = 0.0.0.0 ; Or a specific interface
-    bindport = 8088     ; Matches ARI_URL
-    prefix = ari        ; Sets the base path to /ari
+3.  **ARI Configuration in Asterisk:**
+    *   Ensure `http.conf` and `ari.conf` are configured as described in the "ARI Configuration (ari.conf, http.conf)" section above.
+    *   The Stasis application name used in `extensions.conf` (e.g., `whatsapp-ari-app`) must match the `ARI_APP_NAME` environment variable or the default in the script.
+
+**Running the ARI Script:**
+1.  Navigate to the root of this project directory.
+2.  You can run the script directly using Node.js:
+    ```bash
+    node ari_scripts/ari_whatsapp_connector.js
     ```
-3.  **Reload Asterisk modules:**
-    *   `module reload res_ari.so`
-    *   `module reload res_stasis.so`
-    *   `module reload res_http_websocket.so` (if not already loaded)
-    *   `http reload` (or `core reload`)
+3.  **Environment Variables:** The script can be configured using environment variables for flexibility:
+    *   `ARI_URL`: (Default: `http://localhost:8088`) URL for Asterisk ARI.
+    *   `ARI_USERNAME`: (Default: `asterisk_ari_user`) Username for ARI connection.
+    *   `ARI_PASSWORD`: (Default: `ari_password`) Password for ARI connection.
+    *   `ARI_APP_NAME`: (Default: `whatsapp-ari-app`) Stasis application name.
+    *   `WEBRTC_CLIENT_ENDPOINT`: (Default: `PJSIP/web_client`) The PJSIP endpoint for your WebRTC client.
+    *   `WHATSAPP_TRUNK_ENDPOINT_FOR_OUTBOUND`: (Default: `PJSIP/whatsapp_trunk_endpoint`) PJSIP endpoint for dialing out to WhatsApp (used if ARI handles outbound).
+    *   `YOUR_WHATSAPP_BUSINESS_NUMBER`: (Default: `+12345678901`) Your WhatsApp business number for outbound CallerID.
+
+    Example:
+    ```bash
+    ARI_URL=http://192.168.1.100:8088 ARI_USERNAME=myariuser ARI_PASSWORD=securepass node ari_scripts/ari_whatsapp_connector.js
+    ```
+4.  **Process Management:** For production, you should run this script using a process manager like `pm2` or `systemd` to ensure it runs continuously and restarts on failure.
+
+    Example with `pm2`:
+    ```bash
+    pm2 start ari_scripts/ari_whatsapp_connector.js --name whatsapp-ari-connector
+    pm2 save
+    pm2 startup
+    ```
+
+**Note on Outbound Calls via ARI:**
+The current `ari_whatsapp_connector.js` includes a conceptual function `handleOutboundToWhatsApp`. However, the provided `extensions.conf` routes outbound calls from the WebRTC client directly through the SIP trunk without involving this ARI script. If you wish to have ARI manage outbound calls (e.g., for custom logic, logging, or dynamic caller ID manipulation before hitting the trunk), you would need to:
+1.  Modify the `[from-webrtc]` context in `extensions.conf` to also send calls to the `Stasis(${ARI_APP_NAME},${EXTEN})` application.
+2.  Fully implement and test the `handleOutboundToWhatsApp` function within the ARI script to originate the call to the WhatsApp trunk.
+
+For the current setup, inbound calls from WhatsApp are the primary focus for ARI handling.
 
 ## WebRTC Client Configuration
 
@@ -411,13 +356,22 @@ The WebRTC client (from this repository, `src/lib/client-phone`) needs to be con
 ### Inbound: WhatsApp User to WebRTC Client
 
 1.  WhatsApp user calls your WhatsApp Business Number.
-2.  WhatsApp Cloud API sends a SIP INVITE to your Asterisk server (`whatsapp_trunk_endpoint`).
-3.  Asterisk matches the call via `whatsapp_trunk_identify` and routes it to the `from-whatsapp` context in `extensions.conf`.
-4.  The dialplan executes `Dial(PJSIP/${WEB_CLIENT_EXTEN},...)`, ringing the registered WebRTC client.
-5.  WebRTC client answers.
-6.  Media (RTP) flows between WhatsApp Cloud API and the WebRTC client, relayed by Asterisk.
+2.  WhatsApp Cloud API sends a SIP INVITE to your Asterisk server (matching `whatsapp_trunk_endpoint` and `whatsapp_trunk_identify`).
+3.  Asterisk routes the call to the `from-whatsapp` context in `extensions.conf`.
+4.  The dialplan executes `Stasis(whatsapp-ari-app,${EXTEN})`, sending the call to the `ari_whatsapp_connector.js` application.
+5.  The ARI script (`ari_whatsapp_connector.js`):
+    a.  Receives the `StasisStart` event for the incoming WhatsApp channel.
+    b.  Answers the incoming channel.
+    c.  Originates a new call to the `WEB_CLIENT_ENDPOINT` (e.g., `PJSIP/web_client`).
+    d.  Creates a new mixing bridge.
+    e.  Adds both the incoming WhatsApp channel and the newly originated WebRTC client channel to the bridge.
+6.  The WebRTC client's phone (softphone/application) rings and the user answers.
+7.  Media (RTP) flows between the WhatsApp user and the WebRTC client, mixed through the ARI-controlled bridge in Asterisk.
+8.  If either party hangs up, the ARI script handles tearing down the other leg of the call and destroying the bridge.
 
 ### Outbound: WebRTC Client to WhatsApp User
+
+(This flow assumes the `from-webrtc` context in `extensions.conf` is NOT sending calls to the Stasis application, but dialing directly.)
 
 1.  WebRTC client initiates a call to a WhatsApp user's phone number (e.g., `+15551234567`).
 2.  The client sends a SIP INVITE to Asterisk.
