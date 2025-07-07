@@ -333,6 +333,34 @@ A Node.js script, `ari_scripts/ari_whatsapp_connector.js`, is provided to handle
     pm2 startup
     ```
 
+**Using `.env` for ARI Script Configuration:**
+
+It is highly recommended to use a `.env` file to manage the configuration variables for the ARI script, especially for sensitive information like passwords.
+
+1.  **Create a `.env` file:** In the root directory of the project, create a file named `.env`.
+2.  **Populate `.env`:** Copy the contents from `.env.example` into your new `.env` file.
+3.  **Customize Values:** Modify the values in `.env` to match your Asterisk ARI setup, desired endpoints, and WhatsApp business number.
+
+    ```dotenv
+    # .env (example content, customize for your setup)
+    ARI_URL=http://localhost:8088/ari
+    ARI_USERNAME=asterisk_ari_user
+    ARI_PASSWORD=your_ari_password_here
+    ARI_APP_NAME=whatsapp-ari-app
+    WEBRTC_CLIENT_ENDPOINT=PJSIP/web_client
+    WHATSAPP_TRUNK_ENDPOINT_FOR_OUTBOUND=PJSIP/whatsapp_trunk_endpoint
+    YOUR_WHATSAPP_BUSINESS_NUMBER=+1yourwhatsappnumber
+    ```
+4.  **Loading `.env` (if not using a runner like `pm2` that handles it):**
+    If you run the script directly with `node ari_scripts/ari_whatsapp_connector.js` and want it to automatically load variables from `.env`, you would typically use a package like `dotenv`.
+    To add this:
+    *   Install `dotenv`: `npm install dotenv` (or `yarn add dotenv`)
+    *   Add this line at the very top of `ari_scripts/ari_whatsapp_connector.js`:
+        ```javascript
+        require('dotenv').config();
+        ```
+    The `package.json` would also need `dotenv` added to its dependencies. (Note: This step is informational as per the "no new library installation" constraint for the agent, but crucial for the user).
+
 **Note on Outbound Calls via ARI:**
 The current `ari_whatsapp_connector.js` includes a conceptual function `handleOutboundToWhatsApp`. However, the provided `extensions.conf` routes outbound calls from the WebRTC client directly through the SIP trunk without involving this ARI script. If you wish to have ARI manage outbound calls (e.g., for custom logic, logging, or dynamic caller ID manipulation before hitting the trunk), you would need to:
 1.  Modify the `[from-webrtc]` context in `extensions.conf` to also send calls to the `Stasis(${ARI_APP_NAME},${EXTEN})` application.
